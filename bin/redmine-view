@@ -290,7 +290,7 @@ def help_screen(context):
                     ("s", "статус в черновик"),
                     ("t", "время в черновик"),
                     ("c", "свернуть или развернуть SQL"),
-                    ("v 1..9 ЛКМ-📎", "картинку на весь экран"),
+                    ("v 1..9 ЛКМ-@", "картинку на весь экран"),
                     ("o", "открыть заявку в браузере"),
                     ("r", "обновить заявку"),
                     ("Shift+ЛКМ", "выделить и скопировать текст")]
@@ -332,7 +332,7 @@ def help_screen(context):
         L.append(tx("Клавиша c в карточке сворачивает и разворачивает SQL-блоки."))
         L.append("")
         L.append(sub("Картинки"))
-        L.append(tx("Просмотр: v, цифра 1..9 или клик по 📎 открывают картинку на"))
+        L.append(tx("Просмотр: v, цифра 1..9 или клик по @ открывают картинку на"))
         L.append(tx("весь экран (sixel, нужен foot и chafa). Миниатюры видно сразу."))
         L.append(mt("Загрузки файлов из терминала нет. Чтобы прикрепить картинку,"))
         L.append(mt("нажми o и сделай это в браузере."))
@@ -420,17 +420,17 @@ def review_draft(iss, draft):
         what = " и ".join(x for x in [("комментарий" if draft.get("note") else None),
                                       ("статус" if draft.get("status_id") else None)] if x)
         if ok:
-            print(f"  {R.OK}✓ {what}{R.RESET}")
+            print(f"  {R.OK}+ {what}{R.RESET}")
             draft.update(note=None, private=False, status_id=None, status_name=None)
         else:
-            print(f"  {R.ERR}✗ {what}: {msg}{R.RESET}"); allok = False
+            print(f"  {R.ERR}x {what}: {msg}{R.RESET}"); allok = False
     if res["time"] is not None:
         ok, msg = res["time"]
         if ok:
-            print(f"  {R.OK}✓ время {R.mins_to_hm(draft['mins'])}{R.RESET}")
+            print(f"  {R.OK}+ время {R.mins_to_hm(draft['mins'])}{R.RESET}")
             draft["mins"] = None
         else:
-            print(f"  {R.ERR}✗ время: {msg}{R.RESET}"); allok = False
+            print(f"  {R.ERR}x время: {msg}{R.RESET}"); allok = False
     time.sleep(0.9 if allok else 2.5)
     R.raw_on()
     return "sent" if allok else "partial"
@@ -461,7 +461,7 @@ def show_card(issue_id, rows):
             _lw = 44
             _ld = [R.crow(_lw, T["fg"], T["panel"])]
             _lr = R.crow(_lw, T["accent"], T["panel"])
-            R.cstamp(_lr, 2, f"⏳ загрузка заявки #{issue_id}…", T["accent"], T["panel"], True)
+            R.cstamp(_lr, 2, f"[*] загрузка заявки #{issue_id}…", T["accent"], T["panel"], True)
             _ld.append(_lr); _ld.append(R.crow(_lw, T["fg"], T["panel"]))
             R.panel_screen("REDMINE", _ld, _lw)
             iss = R.get_issue(issue_id)
@@ -497,7 +497,7 @@ def show_card(issue_id, rows):
         remain = max(0, int(REFRESH_SEC - (time.time() - last_side)))
         page = f" · стр.{pg + 1}/{pages}" if pages > 1 else ""
         if _draft_has(draft):
-            footer = (f"{R.WARN}✎ черновик: {' · '.join(_draft_bits(draft))}{R.RESET}  "
+            footer = (f"{R.WARN}* черновик: {' · '.join(_draft_bits(draft))}{R.RESET}  "
                       f"{R.MUT}Enter отправить · a/s/t ещё · q разобрать{R.RESET}")
         else:
             pairs = [("↑↓←→", "листать")]
@@ -548,7 +548,7 @@ def show_card(issue_id, rows):
                             elif did_send:
                                 dirty = True                    # часть осталась, остаёмся на текущей
                     elif i < len(card_page):             # клик по подписи вложения, открыть картинку
-                        m = re.search(r"📎 \[(\d+)\]", card_page[i])
+                        m = re.search(r"@ \[(\d+)\]", card_page[i])
                         if m and imgs:
                             idx = int(m.group(1)) - 1
                             if 0 <= idx < len(imgs):

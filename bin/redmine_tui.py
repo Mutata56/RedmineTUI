@@ -889,7 +889,7 @@ def status_color(name):
 def _inline(s):
     """Инлайн-разметка Textile/Redmine: !картинка! *жирный* _курсив_ @код@ "ссылка":url."""
     s = clean(s)
-    s = _RE_INLINE_IMG.sub(lambda m: f'{MUT}🖼{RESET}', s)
+    s = _RE_INLINE_IMG.sub(lambda m: f'{MUT}[img]{RESET}', s)
     s = _RE_INLINE_LINK.sub(lambda m: f'\033[4m{A}{m.group(1)}{RESET} {MUT}{m.group(2)}{RESET}', s)
     s = _RE_INLINE_BOLD.sub(lambda m: f'{BOLD}{m.group(1)}{RESET}', s)
     s = _RE_INLINE_ITAL.sub(lambda m: f'{ITAL}{m.group(1)}{RESET}', s)
@@ -1167,12 +1167,12 @@ def render_issue_items(issue, st=None, width=None, collapse=True):
         size = f"  {MUT}({_fmt_size(a['filesize'])}){RESET}" if (a and a.get("filesize")) else ""
         if a and is_image(a):
             img_no[0] += 1
-            caption = [f"{indent}{TER}📎 [{img_no[0]}] {nm}{RESET}{size}  {MUT}({img_no[0]} — открыть){RESET}"]
+            caption = [f"{indent}{TER}@ [{img_no[0]}] {nm}{RESET}{size}  {MUT}({img_no[0]} — открыть){RESET}"]
             if a.get("content_url"):
                 caption.append(f"{indent}   {MUT}{a['content_url']}{RESET}")
             L.append(("img", a, caption))          # картинка открывается в галерее по цифре
         else:
-            caption = [f"{indent}{TER}📎 {nm}{RESET}{size}"]
+            caption = [f"{indent}{TER}@ {nm}{RESET}{size}"]
             if a and a.get("content_url"):
                 caption.append(f"{indent}   {MUT}{a['content_url']}{RESET}")
             L.extend(caption)
@@ -1215,7 +1215,7 @@ def render_issue_items(issue, st=None, width=None, collapse=True):
         for d in j.get("details", []):                 # изменения (вложения идут отдельно ниже)
             if d.get("property") == "attachment":
                 if not d.get("new_value"):
-                    L.append(f"      {MUT}🗑 удалил вложение: {clean(d.get('old_value') or '')}{RESET}")
+                    L.append(f"      {MUT}[del] удалил вложение: {clean(d.get('old_value') or '')}{RESET}")
             else:
                 L.append(f"      {MUT}• {_humanize_detail(d, cf_names, st, unames)}{RESET}")
         notes = j.get("notes", "") or ""
@@ -1229,7 +1229,7 @@ def render_issue_items(issue, st=None, width=None, collapse=True):
     return L
 
 def render_issue(issue, st=None, width=None, collapse=True):
-    """ANSI-строка карточки (картинки идут как подпись 📎); для pager/shift-fix."""
+    """ANSI-строка карточки (картинки идут как подпись @); для pager/shift-fix."""
     out = []
     for it in render_issue_items(issue, st, width, collapse):
         if isinstance(it, tuple):
@@ -1294,7 +1294,7 @@ def gallery(imgs, start=0):
         c, r = shutil.get_terminal_size((100, 40))
         clear()
         a = imgs[cur]
-        sys.stdout.write(f"  {A}{BOLD}🖼  {clean(a.get('filename',''))}{RESET}"
+        sys.stdout.write(f"  {A}{BOLD}[img]  {clean(a.get('filename',''))}{RESET}"
                          f"  {MUT}[{cur+1}/{len(imgs)}] ({_fmt_size(a.get('filesize',0))}){RESET}\n\n")
         p = download_att(a)
         shown = False
@@ -1518,7 +1518,7 @@ def add_comment_ui(issue, paste_sql=False):
     private = c.startswith("i")                          # i / ш(рус) = внутренний
     ok, msg = add_comment(iid, text, private=private)
     tag = f" {ERR}(внутренний){RESET}" if private else ""
-    print(f"\n  {OK}✓ комментарий{tag}{OK} записан{RESET}" if ok else f"\n  {ERR}✗ ошибка: {msg}{RESET}")
+    print(f"\n  {OK}+ комментарий{tag}{OK} записан{RESET}" if ok else f"\n  {ERR}x ошибка: {msg}{RESET}")
     time.sleep(1.0 if ok else 2.5)
     raw_on()
     return ok
@@ -1581,7 +1581,7 @@ def change_status_ui(issue):
     if not _yes(f"\n  {WARN}Перевести #{iid} → «{nm}»?{RESET} [да / Enter — нет]: "):
         raw_on(); return False
     ok, msg = set_status(iid, sid)
-    print(f"\n  {OK}✓ статус → {nm}{RESET}" if ok else f"\n  {ERR}✗ ошибка: {msg}{RESET}")
+    print(f"\n  {OK}+ статус → {nm}{RESET}" if ok else f"\n  {ERR}x ошибка: {msg}{RESET}")
     time.sleep(1.0 if ok else 2.5)
     raw_on()
     return ok
@@ -1625,7 +1625,7 @@ def add_time_ui(issue):
     if not _yes(f"\n  Списать {mins_to_hm(mins)} ({mins} мин) в #{iid}? [да / Enter — нет]: "):
         raw_on(); return False
     ok, msg = add_time(iid, mins)
-    print(f"\n  {OK}✓ списано {mins_to_hm(mins)}{RESET}" if ok else f"\n  {ERR}✗ ошибка: {msg}{RESET}")
+    print(f"\n  {OK}+ списано {mins_to_hm(mins)}{RESET}" if ok else f"\n  {ERR}x ошибка: {msg}{RESET}")
     time.sleep(1.0 if ok else 2.5)
     raw_on()
     return ok

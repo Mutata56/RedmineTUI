@@ -118,8 +118,8 @@ def render_summary(data, dates):
     print(LINE + "─" * w + RESET)
 
 def flags_line(t):
-    f = [f"{OK}причина ✓{RESET}" if t["reason"] else f"{ERR}причина — НЕТ{RESET}",
-         f"{OK}время ✓{RESET}" if t["hasTime"] else f"{ERR}время — НЕТ{RESET}"]
+    f = [f"{OK}причина +{RESET}" if t["reason"] else f"{ERR}причина — НЕТ{RESET}",
+         f"{OK}время +{RESET}" if t["hasTime"] else f"{ERR}время — НЕТ{RESET}"]
     return "  " + "    ".join(f)
 
 _cache = {}
@@ -176,7 +176,7 @@ def main():
     yest = today - datetime.timedelta(days=1)
     dates = f"{yest.strftime('%d.%m')}–{today.strftime('%d.%m')}"
     if DRYRUN:
-        print(f"{R.WARN}{BOLD}  ⚠ DRY-RUN: ничего не пишется в Redmine, только показываю запросы.{RESET}")
+        print(f"{R.WARN}{BOLD}  [!] DRY-RUN: ничего не пишется в Redmine, только показываю запросы.{RESET}")
 
     cmd = [os.path.expanduser("~/.local/bin/redmine-shift"), "--json"] + IDS
     result = {}
@@ -200,7 +200,7 @@ def main():
 
     problems = [t for t in data if t["reason"] == "" or not t["hasTime"]]
     if not problems:
-        print(f"\n{OK}{BOLD}  ✓ Все заявки в порядке — причина и трудозатраты везде проставлены.{RESET}")
+        print(f"\n{OK}{BOLD}  + Все заявки в порядке — причина и трудозатраты везде проставлены.{RESET}")
     else:
         prefetch([t["id"] for t in problems])
         print(f"\n{TER}{BOLD}  Требуют разбора: {len(problems)}{RESET}  {DIM}(Enter — пропустить поле, q — выход){RESET}")
@@ -233,7 +233,7 @@ def main():
                     ok, msg = set_reason(t["id"], v); label = f"причина «{v}»"
                 else:
                     ok, msg = add_time(t["id"], v); label = f"время {v}м ({mins_to_hm(v)})"
-                mark = f"{OK}✓{RESET}" if ok else f"{ERR}✗{RESET}"
+                mark = f"{OK}+{RESET}" if ok else f"{ERR}x{RESET}"
                 print(f"  {mark} {label}  {DIM}{msg}{RESET}")
             done += 1
             if not DRYRUN:
@@ -247,7 +247,7 @@ def main():
     else:
         print(f"{DIM}Обновляю смену в буфере…{RESET}")
         subprocess.run([os.path.expanduser("~/.local/bin/redmine-shift")] + IDS, stdout=subprocess.DEVNULL)
-        print(f"{OK}  ✓ Смена скопирована в буфер.{RESET}")
+        print(f"{OK}  + Смена скопирована в буфер.{RESET}")
 
     try:
         input(f"\n{DIM}Enter — закрыть…{RESET}")

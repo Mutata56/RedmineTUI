@@ -41,7 +41,7 @@ fi
 
 KEY="$(secret-tool lookup service redmine-notify 2>/dev/null || true)"
 if [ -z "$KEY" ]; then
-    echo "❌ Нет ключа Redmine в secret-tool (service=redmine-notify)." >&2
+    echo "[x] Нет ключа Redmine в secret-tool (service=redmine-notify)." >&2
     [ "$MODE" = "json" ] && echo "[]"
     note -u critical "Смена" "Нет ключа Redmine (secret-tool service=redmine-notify)"
     exit 1
@@ -76,7 +76,7 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-[ "$MODE" = "text" ] && echo "⏳ Собираю смену за $YEST … $TODAY …" >&2
+[ "$MODE" = "text" ] && echo "[*] Собираю смену за $YEST … $TODAY …" >&2
 
 # ── собрать ID задач из двух источников, ПАРАЛЛЕЛЬНО по всем пользователям ────
 i=0
@@ -92,7 +92,7 @@ cat "$TMP"/L_* 2>/dev/null | sort -un > "$TMP/uids"
 
 if [ ! -s "$TMP/uids" ]; then
     if [ "$MODE" = "json" ]; then echo "[]"; else
-        echo "🟢 Нет задач за смену ($YEST … $TODAY)." >&2
+        echo "[ok] Нет задач за смену ($YEST … $TODAY)." >&2
         note "Смена" "Нет задач за $YEST … $TODAY"
     fi
     exit 0
@@ -156,6 +156,6 @@ count="$(grep -c '/issues/' "$TMP/shift.txt" 2>/dev/null || echo 0)"
 if command -v wl-copy >/dev/null 2>&1; then
     wl-copy < "$TMP/shift.txt"
     echo >&2
-    echo "📋 Смена скопирована в буфер ($count задач за $YEST … $TODAY)." >&2
+    echo "[copy] Смена скопирована в буфер ($count задач за $YEST … $TODAY)." >&2
 fi
 note "Смена собрана" "$count задач за $YEST … $TODAY — в буфере"

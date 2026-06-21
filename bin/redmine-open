@@ -6,7 +6,7 @@ CONF="${XDG_CONFIG_HOME:-$HOME/.config}/redmine-tui.conf"   # единый ко�
 [ -f "$CONF" ] && . "$CONF"
 BASE="${BASE:-https://redmine.example.com}"
 
-n=$(: | fuzzel --dmenu --namespace fuzzel-menu --prompt='Redmine ❯ ' --placeholder='номер заявки')
+n=$(: | fuzzel --dmenu --namespace fuzzel-menu --prompt='Redmine > ' --placeholder='номер заявки')
 n=$(printf '%s' "$n" | tr -cd '0-9')
 [ -z "$n" ] && exit 0
 exec "$HOME/.local/bin/chrome-here" "$BASE/issues/$n"
