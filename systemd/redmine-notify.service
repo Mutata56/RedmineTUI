@@ -1,0 +1,12 @@
+[Unit]
+Description=Redmine notify daemon — polls Redmine + clickable "Открыть заявку" action
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/redmine-notify --daemon
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

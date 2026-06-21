@@ -1,0 +1,17 @@
+# redmine-notify — конфиг демона.  → копировать в ~/.config/redmine-notify/config
+# API-ключ здесь НЕ хранится — он в secret-tool (service=redmine-notify):
+#   secret-tool store --label="Redmine API" service redmine-notify
+REDMINE_URL=https://redmine.example.com
+
+# Статусы для слежки (точное совпадение issue.status.name), через запятую.
+WATCH_STATUSES=New,Feedback
+
+# Источники: query-строки Redmine API через " || ". Каждый пагинируется,
+# затем фильтруется клиентом по WATCH_STATUSES.
+SOURCES=status_id=open&sort=updated_on:desc
+
+LIMIT=100
+MAX_NOTIFY=10
+SEEN_KEEP=2000
+URGENCY=critical
+POLL_SECONDS=60

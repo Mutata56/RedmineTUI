@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""SUPER+I: TUI просмотра активных заявок Redmine в стиле dbpick.
+
+Центрированная панель (фон по теме), список СГРУППИРОВАН по статусу (▍-заголовки),
+выделение строки фоном-акцентом. Стрелки вверх и вниз выбирают строку, Enter открывает карточку заявки со всей
+историей и вложениями, цифры открывают по номеру, o в браузере, r или авто обновляют.
+Тема caelestia живая (меняется со сменой фона). Тест без tty: RMSHIFT_ALLOW_PIPE=1.
+"""
+import sys, os, time, signal, subprocess, shutil, select, threading, re
+from collections import Counter
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import redmine_tui as R
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+GROUP_ORDER = {"Новая": 0, "Новая инфо": 1, "В работе": 2}
+REFRESH_SEC, TICK = 60, 1          # TICK=1с, живой обратный отсчёт до обновления
+LAST_FETCH = {"err": None, "stale": False}   # статус последнего fetch_list (для экрана/сводки)
+
+# self-pipe: SIGWINCH (ресайз или зум шрифта Ctrl+=) даёт мгновенную перерисовку
+_winch_r, _winch_w = os.pipe()
+os.set_blocking(_winch_r, False)
+def _on_winch(*_):
+    try:
+        os.write(_winch_w, b"x")
+    except Exception:
+        pass
+
+def wait_key(timeout=TICK):
+    """Клавиша / 'RESIZE' (зум-ресайз) / None (таймаут). timeout поменьше нужен для анимации спиннера."""
+    try:
+        rdy, _, _ = select.select([R._FD, _winch_r], [], [], timeout)
+    except (InterruptedError, OSError):
+        return "RESIZE"
+    if _winch_r in rdy:
+        try:
+            os.read(_winch_r, 64)
+        except OSError:
+            pass
+        return "RESIZE"
+    if R._FD in rdy:
+        return R.read_key()
+    return None
+
+def fetch_list():
+    """TSV активных заявок. Различает: ok, устаревший кэш (stale), ошибка (err);
+    redmine-list пишет признак в stderr и код возврата. Статус идёт в LAST_FETCH."""
+    out, err, stale = "", None, False
+    try:
+        p = subprocess.run([os.path.join(HERE, "redmine-list")],
+                           capture_output=True, text=True, timeout=40)
+        out = p.stdout
+        se = (p.stderr or "").strip()
+        if p.returncode != 0:
+            err = se or f"redmine-list завершился с кодом {p.returncode}"
+        elif se:
+            stale = True                       # сеть упала, отдан кэш
+    except subprocess.TimeoutExpired:
+        err = "таймаут запроса (>40с) — сеть/VPN недоступны"
+    except Exception as e:
+        err = str(e)
+    rows = []
+    for ln in out.splitlines():
+        p2 = ln.split("\t")
+        if len(p2) >= 2 and p2[0].isdigit():
+            rows.append({"id": p2[0], "status": p2[1], "subject": p2[2] if len(p2) > 2 else "",
+                         "assignee": p2[3] if len(p2) > 3 else "", "updated": p2[4] if len(p2) > 4 else "",
+                         "project": p2[5] if len(p2) > 5 else ""})
+    rows.sort(key=lambda r: GROUP_ORDER.get(r["status"], 9))
+    LAST_FETCH["err"] = err if not rows else None
+    LAST_FETCH["stale"] = stale
+    return rows
+
+def draw(rows, sel, numbuf, last_refresh, query="", stat=None, searching=False, busy=""):
+    T = R.T
+    c, r = shutil.get_terminal_size((100, 40))
+    CW = min(c - 4, 106)
+    inner_h = max(12, r - 4)
+    list_h = max(4, inner_h - 5)
+    cnt = Counter(it["status"] for it in rows)
+    remain = max(0, int(REFRESH_SEC - (time.time() - last_refresh)))
+
+    visual, sel_vis, last = [], 0, None
+    for i, it in enumerate(rows):
+        if it["status"] != last:
+            visual.append(("hdr", it["status"])); last = it["status"]
+        if i == sel:
+            sel_vis = len(visual)
+        visual.append(("row", i))
+    topv = max(0, min(sel_vis - list_h // 2, max(0, len(visual) - list_h)))
+    window = visual[topv:topv + list_h]
+
+    inner = [R.crow(CW, T["fg"], T["panel"])]
+    if query or stat or searching:
+        cur = "▌" if searching else ""
+        bits = [f"найдено {len(rows)}"]
+        if query or searching:
+            bits.append(f"поиск: /{query}{cur}")
+        if stat:
+            bits.append(f"статус: {stat}")
+        summ = "     ".join(bits)
+    else:
+        summ = f"всего {len(rows)}     " + "     ".join(f"{s} · {cnt[s]}" for s in ("Новая", "Новая инфо", "В работе") if cnt.get(s))
+    rw = R.crow(CW, T["muted"], T["panel"])
+    R.cstamp(rw, 2, summ, T["accent"] if searching else T["muted"], T["panel"], searching)
+    if busy:
+        tail, tcol = busy, T["accent"]
+    else:
+        tail = f"обновление через {remain}с" + ("   · кэш" if LAST_FETCH.get("stale") else "")
+        tcol = T["warn"] if LAST_FETCH.get("stale") else T["muted"]
+    R.cstamp(rw, CW - len(tail) - 2, tail, tcol, T["panel"], bool(busy))
+    inner.append(rw)
+    sep = R.crow(CW, T["line"], T["panel"]); R.cstamp(sep, 2, "─" * (CW - 4), T["line"], T["panel"]); inner.append(sep)
+
+    for v in window:
+        rw = R.crow(CW, T["fg"], T["panel"])
+        if v[0] == "hdr":
+            st = v[1]
+            R.cstamp(rw, 1, "▍", T["accent"], T["panel"], True)
+            R.cstamp(rw, 3, f"{st}  ({cnt[st]})", T["secondary"], T["panel"], True)
+        else:
+            it = rows[v[1]]; cur = (v[1] == sel)
+            idtxt = f"#{it['id']}"                       # порядок: номер, Клиент, Тема
+            client = it["project"] or ""
+            subj = it["subject"] or ""
+            if cur:
+                R.cfill(rw, 1, CW - 1, T["accent"])
+                x = 2
+                R.cstamp(rw, x, "▸ " + idtxt, T["on_accent"], T["accent"], True); x += 2 + len(idtxt) + 2
+                if client:
+                    R.cstamp(rw, x, client, T["on_accent"], T["accent"], True); x += len(client) + 2
+                R.cstamp(rw, x, subj, T["on_accent"], T["accent"], True)
+            else:
+                x = 4
+                R.cstamp(rw, x, idtxt, T["accent"], T["panel"], True); x += len(idtxt) + 2
+                if client:
+                    R.cstamp(rw, x, client, T["tertiary"], T["panel"]); x += len(client) + 2
+                R.cstamp(rw, x, subj, T["fg"], T["panel"])
+        inner.append(rw)
+    for _ in range(list_h - len(window)):
+        inner.append(R.crow(CW, T["fg"], T["panel"]))
+
+    inner.append(R.crow(CW, T["fg"], T["panel"]))
+    foot = R.crow(CW, T["muted"], T["panel"])
+    hint = ("  ↑/↓ ⏎ открыть    / поиск    f фильтр    ? помощь" + (f"   №[{numbuf}]" if numbuf else "")
+            + "    o браузер    r обновить    q выход")
+    R.cstamp(foot, 2, hint, T["muted"], T["panel"])
+    for key in ("↑/↓", "⏎", "/", "f", "?", "o", "r", "q"):
+        idx = hint.find(key)
+        if idx >= 0:
+            R.cstamp(foot, 2 + idx, key, T["accent"], T["panel"], True)
+    inner.append(foot)
+    R.panel_screen("REDMINE · активные заявки", inner, CW)
+    # карта кликов: экранная строка в индекс заявки; колонки хоткеев футера
+    box_w, box_h = CW + 2, len(inner) + 2
+    ox, oy = max(0, (c - box_w) // 2), max(0, (r - box_h) // 2)
+    zrows = {oy + 5 + i: v[1] for i, v in enumerate(window) if v[0] == "row"}
+    foot_keys = {}
+    for key in ("o", "r", "q"):
+        idx = hint.find(key)
+        if idx >= 0:
+            foot_keys[ox + 4 + idx] = key
+    return {"rows": zrows, "foot_row": oy + 2 + (len(inner) - 1), "foot_keys": foot_keys}
+
+def splash(done):
+    """ASCII-анимация загрузки (бегущий акцентный блок + спиннер), пока тянем заявки."""
+    spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    msgs = ["подключаюсь к Redmine…", "тяну активные заявки…", "собираю по проектам…", "почти готово…"]
+    track, cw, i = 28, 46, 0
+    while True:
+        if R.theme_changed():
+            R.reload_theme()
+        T = R.T
+        pos = i % (2 * (track - 1))
+        if pos >= track:
+            pos = 2 * (track - 1) - pos
+        inner = [R.crow(cw, T["fg"], T["panel"]), R.crow(cw, T["fg"], T["panel"])]
+        tl = R.crow(cw, T["accent"], T["panel"]); R.cstamp(tl, (cw - 7) // 2, "REDMINE", T["accent"], T["panel"], True); inner.append(tl)
+        inner.append(R.crow(cw, T["fg"], T["panel"]))
+        tr = R.crow(cw, T["muted"], T["panel"]); x0 = (cw - track) // 2
+        for k in range(track):
+            R.cstamp(tr, x0 + k, "─", T["line"], T["panel"])
+        for dx, ch in ((-1, "▒"), (0, "█"), (1, "▒")):
+            xp = x0 + pos + dx
+            if x0 <= xp < x0 + track:
+                R.cstamp(tr, xp, ch, T["accent"], T["panel"], True)
+        inner.append(tr)
+        inner.append(R.crow(cw, T["fg"], T["panel"]))
+        msg = f"{spin[i % len(spin)]}  {msgs[(i // 10) % len(msgs)]}"
+        mr = R.crow(cw, T["secondary"], T["panel"]); R.cstamp(mr, (cw - R.vlen(msg)) // 2, msg, T["secondary"], T["panel"]); inner.append(mr)
+        inner.append(R.crow(cw, T["fg"], T["panel"]))
+        R.panel_screen("загрузка", inner, cw)
+        if done():
+            break
+        time.sleep(0.08); i += 1
+
+def _clipv(s, w):
+    """Обрезать строку до видимой ширины w (с учётом двойной ширины эмодзи), добавив '…'."""
+    if w <= 0:
+        return ""
+    if R.dwidth(s) <= w:
+        return s
+    out, acc = "", 0
+    for ch in s:
+        cw = R._cwidth(ch)
+        if acc + cw > w - 1:
+            break
+        out += ch; acc += cw
+    return out + "…"
+
+def _sidebar_lines(rows, cur_id, height, lw):
+    """Левая колонка карточки: (строки, ids), где ids[i]=id заявки в строке i (None у шапки и пустых),
+    чтобы клик мышью по строке мог переключить заявку."""
+    out = [f"{R.A}{R.BOLD}{_clipv('АКТИВНЫЕ · ' + str(len(rows)), lw)}{R.RESET}",
+           f"{R.LINE}{'─' * lw}{R.RESET}"]
+    ids = [None, None]
+    avail = max(1, height - 2)
+    n = len(rows)
+    ci = next((i for i, r in enumerate(rows) if str(r["id"]) == str(cur_id)), -1)
+    top = max(0, min((ci - avail // 2) if ci >= 0 else 0, max(0, n - avail)))
+    for r in rows[top:top + avail]:
+        idtxt = f"#{r['id']}"
+        client = (r.get("project", "") or "").replace(" - ТП", "").replace(" - Т/П", "")
+        subj = r.get("subject", "") or ""
+        body = f"{client}: {subj}" if client else subj
+        if str(r["id"]) == str(cur_id):
+            out.append(f"{R.A}{R.BOLD}{_clipv('▸ ' + idtxt + ' ' + body, lw)}{R.RESET}")
+        else:
+            rest = _clipv(body, max(1, lw - 2 - len(idtxt) - 1))
+            out.append(f"  {R.status_color(r.get('status', ''))}{idtxt}{R.RESET} {R.FG}{rest}{R.RESET}")
+        ids.append(str(r["id"]))
+    while len(out) < height:
+        out.append(""); ids.append(None)
+    return out[:height], ids[:height]
+
+def _card_layout():
+    c, r = shutil.get_terminal_size((100, 40))
+    CW = min(c - 4, 130)                                 # ширина общей панели (как у списка)
+    sidebar = CW >= 92                                   # узкий терминал, без боковой колонки
+    lw = 34 if sidebar else 0
+    content_w = (CW - lw - 3) if sidebar else CW
+    inner_h = max(8, r - 4)
+    body = inner_h - 2                                   # последние 2 ряда тела: разделитель + футер
+    return c, r, CW, sidebar, lw, content_w, body
+
+def _match(r, query, stat):
+    """Заявка проходит фильтр (статус + подстрока по #id/клиент/тема, регистр игнор)."""
+    if stat and r["status"] != stat:
+        return False
+    if query:
+        hay = f"#{r['id']} {r.get('project','')} {r.get('subject','')}".casefold()
+        if query.casefold() not in hay:
+            return False
+    return True
+
+def search_loop(rows, query, stat, last_refresh):
+    """Живой инкрементальный поиск: печатаешь, список фильтруется. Enter оставляет, Esc сбрасывает."""
+    while True:
+        view = [r for r in rows if _match(r, query, stat)]
+        draw(view, 0, "", last_refresh, query, stat, searching=True)
+        k = R.read_key(translate=False)              # сырой символ (кириллицу не нормализуем)
+        if k == "EOF" or k == "ENTER":
+            return query
+        if k == "ESC":
+            return ""
+        if isinstance(k, tuple):
+            continue
+        if k == "\x7f":                              # backspace
+            query = query[:-1]
+        elif isinstance(k, str) and len(k) == 1 and k >= " ":
+            query += k
+
+def help_screen(context):
+    """Руководство по «?»: горячие клавиши, как редактировать заявку, вставлять SQL
+    и картинки, как инструмент устроен и сколько ест против браузера. Листается."""
+    def build():
+        A, FG, MUT, SEC, TER, B, X = R.A, R.FG, R.MUT, R.SEC, R.TER, R.BOLD, R.RESET
+        def hdr(s): return f"{A}{B}  {s}{X}"
+        def sub(s): return f"{TER}{B}  {s}{X}"
+        def kv(k, d): return f"  {A}{k}{X}" + " " * max(1, 16 - R.dwidth(k)) + f"{FG}{d}{X}"
+        def tx(s): return f"  {FG}{s}{X}"
+        def mt(s): return f"  {MUT}{s}{X}"
+        L = [hdr("ГОРЯЧИЕ КЛАВИШИ"), ""]
+        if context == "card":
+            L.append(sub("Карточка заявки"))
+            keys = [("↑↓←→ PgUp/Dn", "листать страницы карточки"),
+                    ("Enter", "отправить черновик (пусто = назад)"),
+                    ("Esc q", "назад к списку"),
+                    ("a", "комментарий в черновик"),
+                    ("p", "коммент с SQL в черновик"),
+                    ("s", "статус в черновик"),
+                    ("t", "время в черновик"),
+                    ("c", "свернуть или развернуть SQL"),
+                    ("v 1..9 ЛКМ-📎", "картинку на весь экран"),
+                    ("o", "открыть заявку в браузере"),
+                    ("r", "обновить заявку"),
+                    ("Shift+ЛКМ", "выделить и скопировать текст")]
+        else:
+            L.append(sub("Список заявок"))
+            keys = [("↑↓ j k", "выбор заявки"),
+                    ("Enter →", "открыть заявку"),
+                    ("/", "поиск по клиенту, теме, номеру"),
+                    ("f", "фильтр по статусу по кругу"),
+                    ("a s t", "коммент, статус, время по выбранной"),
+                    ("цифры Enter", "перейти по номеру"),
+                    ("o", "открыть в браузере"),
+                    ("r", "обновить список"),
+                    ("q Esc", "сброс фильтра, затем выход")]
+        for k, d in keys:
+            L.append(kv(k, d))
+        L += ["", hdr("КАК РАБОТАТЬ"), ""]
+        L.append(sub("Редактирование заявки (черновик)"))
+        L.append(tx("a, p, s, t не шлют сразу, а копят черновик заявки: коммент,"))
+        L.append(tx("статус, трудозатраты. В подвале видно, что уже набрано."))
+        L.append(tx("Enter открывает разбор и отправляет: коммент и статус одним"))
+        L.append(tx("запросом, время отдельным. Перед отправкой спросит «да»."))
+        L.append(tx("Уйти с непустым черновиком (q/Esc) молча не даст: предложит"))
+        L.append(tx("отправить, отбросить или остаться."))
+        L.append("")
+        L.append(sub("Редактор комментария"))
+        L.append(tx("Слева пишешь Textile-разметку, справа живой предпросмотр."))
+        L.append(kv("Ctrl+D", "готово, перейти к подтверждению"))
+        L.append(kv("Ctrl+P", "вставить SQL из буфера"))
+        L.append(kv("Ctrl+E", "открыть во внешнем $EDITOR"))
+        L.append(kv("Esc", "отмена"))
+        L.append(tx("После Ctrl+D: Enter записать обычный, i внутренний (приватный),"))
+        L.append(tx("n отмена."))
+        L.append("")
+        L.append(sub("Вставка SQL"))
+        L.append(tx("Из карточки: p сразу делает коммент с SQL из буфера (в черновик)."))
+        L.append(tx("В самом редакторе (после a): Ctrl+P вставляет SQL из буфера в"))
+        L.append(tx('блок <pre><code class="sql"> под курсор, теги уже закрыты.'))
+        L.append(tx("Клавиша c в карточке сворачивает и разворачивает SQL-блоки."))
+        L.append("")
+        L.append(sub("Картинки"))
+        L.append(tx("Просмотр: v, цифра 1..9 или клик по 📎 открывают картинку на"))
+        L.append(tx("весь экран (sixel, нужен foot и chafa). Миниатюры видно сразу."))
+        L.append(mt("Загрузки файлов из терминала нет. Чтобы прикрепить картинку,"))
+        L.append(mt("нажми o и сделай это в браузере."))
+        L += ["", hdr("КАК ЭТО УСТРОЕНО И НАГРУЗКА"), ""]
+        L.append(sub("Что это"))
+        L.append(tx("Терминальный TUI. Ходит прямо в Redmine REST API (keep-alive"))
+        L.append(tx("HTTPS), берёт JSON заявок и рисует текстом в foot. Браузерного"))
+        L.append(tx("движка, DOM и JS нет. Статусы и юзеры кэшируются на сутки,"))
+        L.append(tx("картинки sixel на 36 часов (~/.cache)."))
+        L.append("")
+        L.append(sub("Нагрузка на твой комп"))
+        L.append(tx("Один процесс Python. В покое CPU около нуля, память десятки МБ."))
+        L.append(tx("Карточка в простое ничего не пересчитывает, кадр кэшируется."))
+        L.append("")
+        L.append(sub("Нагрузка на сервер"))
+        L.append(tx("Открыть заявку это один GET /issues/ID.json. Список это пара GET"))
+        L.append(tx("с пагинацией плюс кэш. Демон уведомлений опрашивает раз в минуту."))
+        L += ["", sub("Сравнение"), ""]
+        L.append(f"  {A}{B}Google Chrome{X}{FG} (веб-интерфейс Redmine){X}")
+        L.append(tx("Запускается Chromium, сотни МБ на профиль и вкладку. Грузится"))
+        L.append(tx("вся веб-страница Redmine: HTML, CSS, десятки JS, шрифты, картинки."))
+        L.append("")
+        L.append(f"  {A}{B}Браузерное расширение{X}{FG} (надстройка над веб-Redmine){X}")
+        L.append(tx("Расширение Chrome (MV3) живёт поверх того же Chrome: вся нагрузка"))
+        L.append(tx("браузера плюс свой service-worker, popup и content-скрипты, которые"))
+        L.append(tx("инжектятся в страницы и держат таймеры, хранилище, OAuth. Браузер"))
+        L.append(tx("плюс надстройка, тяжелее чистого Chrome, не легче."))
+        L.append("")
+        L.append(f"  {A}{B}redmine-view{X}{FG} (этот инструмент){X}")
+        L.append(tx("Терминал плюс Python. Памяти в десятки раз меньше вкладки Chrome,"))
+        L.append(tx("запросов к серверу меньше, открытие заявки мгновенно из кэша."))
+        L.append(mt("Минус: нет загрузки файлов и нет почты или мессенджера. Для этого"))
+        L.append(mt("остаётся браузер (o)."))
+        L += ["", f"  {SEC}{B}Коротко{X}"]
+        L.append(tx("Для чтения, статусов, времени и SQL-комментариев TUI быстрее и"))
+        L.append(tx("легче. Для вложений-картинок и не-Redmine задач (почта,"))
+        L.append(tx("мессенджер) остаётся браузер с расширением."))
+        return L
+    R.pager(build(), title="REDMINE · руководство", hint="←/→ листать · q закрыть", rerender=build)
+
+def _draft_has(d):
+    return bool(d.get("note") or d.get("status_id") or d.get("mins"))
+
+def _draft_bits(d):
+    b = []
+    if d.get("note"):
+        b.append("коммент" + ("(вн)" if d.get("private") else ""))
+    if d.get("status_id"):
+        b.append(f"статус→{d.get('status_name')}")
+    if d.get("mins"):
+        b.append(R.mins_to_hm(d["mins"]))
+    return b
+
+def review_draft(iss, draft):
+    """Разбор черновика: показать, спросить явное «да», отправить. Возвращает 'sent'
+    (всё ушло), 'partial' (часть не ушла, осталась в черновике), 'discard' или 'stay'.
+    Чистит в черновике только то, что реально отправилось."""
+    iid = iss.get("id")
+    R.raw_off(); R.clear()
+    print(f"  {R.A}{R.BOLD}Отправить в #{iid}:{R.RESET}\n")
+    if draft.get("note"):
+        tag = f" {R.ERR}(внутренний){R.RESET}" if draft.get("private") else ""
+        print(f"  {R.SEC}Комментарий{tag}:{R.RESET}")
+        for l in draft["note"].split("\n"):
+            print(f"    {l}")
+    if draft.get("status_id"):
+        print(f"  {R.SEC}Статус:{R.RESET} {R.status_color(draft.get('status_name'))}{draft.get('status_name')}{R.RESET}")
+    if draft.get("mins"):
+        print(f"  {R.SEC}Время:{R.RESET} {R.mins_to_hm(draft['mins'])} ({draft['mins']} мин)")
+    print(f"\n  {R.MUT}да/y отправить · o отбросить · Enter остаться{R.RESET}")
+    try:
+        raw = input("  > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raw = ""
+    if raw[:1] in ("o", "о", "щ"):                       # отбросить весь черновик
+        draft.update(note=None, private=False, status_id=None, status_name=None, mins=None)
+        R.raw_on(); return "discard"
+    affirm = raw in ("y", "yes", "yep", "ok", "да", "д", "ага") or raw.translate(R._RU2EN).startswith("y")
+    if not affirm:                                       # Enter или что-то ещё это остаться
+        R.raw_on(); return "stay"
+    res = R.submit_draft(iid, draft)
+    allok = True
+    if res["issue"] is not None:
+        ok, msg = res["issue"]
+        what = " и ".join(x for x in [("комментарий" if draft.get("note") else None),
+                                      ("статус" if draft.get("status_id") else None)] if x)
+        if ok:
+            print(f"  {R.OK}✓ {what}{R.RESET}")
+            draft.update(note=None, private=False, status_id=None, status_name=None)
+        else:
+            print(f"  {R.ERR}✗ {what}: {msg}{R.RESET}"); allok = False
+    if res["time"] is not None:
+        ok, msg = res["time"]
+        if ok:
+            print(f"  {R.OK}✓ время {R.mins_to_hm(draft['mins'])}{R.RESET}")
+            draft["mins"] = None
+        else:
+            print(f"  {R.ERR}✗ время: {msg}{R.RESET}"); allok = False
+    time.sleep(0.9 if allok else 2.5)
+    R.raw_on()
+    return "sent" if allok else "partial"
+
+def _leave_ok(iss, draft):
+    """Можно ли уйти из карточки. Пустой черновик это да. Иначе разобрать; уйти можно,
+    только если после разбора в черновике ничего не осталось. Возвращает (can_leave, did_send)."""
+    if not _draft_has(draft):
+        return True, False
+    res = review_draft(iss, draft); R.mouse_on()        # review_draft сам чистит ушедшее/отброшенное
+    return (not _draft_has(draft)), (res in ("sent", "partial"))
+
+def show_card(issue_id, rows):
+    """Карточка заявки + ЖИВАЯ левая колонка со списком активных заявок.
+    SQL развёрнут по умолчанию (c сворачивает). o открывает заявку в браузере."""
+    collapsed = False
+    side_rows = list(rows or [])
+    last_side = time.time()
+    side_bg = {"loading": False, "rows": None}           # фоновое обновление сайдбара (без фриза UI)
+    pg, iss, st, dirty = 0, None, None, True
+    cache = {"sig": None, "vis": [], "imgs": []}         # карточка пересобирается только при изменениях
+    draft = {"note": None, "private": False, "status_id": None, "status_name": None, "mins": None}
+    while True:
+        if dirty:
+            if R.theme_changed():
+                R.reload_theme()
+            T = R.T                                      # кадр «загрузка», UI не выглядит зависшим, пока тянем заявку
+            _lw = 44
+            _ld = [R.crow(_lw, T["fg"], T["panel"])]
+            _lr = R.crow(_lw, T["accent"], T["panel"])
+            R.cstamp(_lr, 2, f"⏳ загрузка заявки #{issue_id}…", T["accent"], T["panel"], True)
+            _ld.append(_lr); _ld.append(R.crow(_lw, T["fg"], T["panel"]))
+            R.panel_screen("REDMINE", _ld, _lw)
+            iss = R.get_issue(issue_id)
+            st = R.status_map()
+            cache["sig"] = None                          # принудить пересборку
+            dirty = False
+            if not iss:
+                R.clear()
+                print(f"{R.ERR}  Заявка #{issue_id} не найдена или нет доступа.{R.RESET}")
+                print(f"{R.MUT}  любая клавиша — назад{R.RESET}")
+                R.read_key()
+                return "back"
+        c, r, CW, sidebar, lw, content_w, body = _card_layout()
+        sig = (collapsed, content_w, R._scheme_mtime())  # дорогую отрисовку кэшируем по этому ключу
+        if sig != cache["sig"]:
+            items = R.render_issue_items(iss, st=st, width=content_w + 1, collapse=collapsed)
+            lines, imgs = [], []
+            for it in items:
+                if isinstance(it, tuple) and it[0] == "img":
+                    imgs.append(it[1]); lines += it[2]
+                else:
+                    lines.append(it)
+            vis = []
+            for ln in lines:
+                vis += [ln] if R.vlen(ln) <= content_w else R.ansi_wrap(ln, content_w)
+            cache.update(sig=sig, vis=vis, imgs=imgs)
+        vis, imgs = cache["vis"], cache["imgs"]
+        pages = max(1, -(-len(vis) // body))
+        pg = max(0, min(pg, pages - 1))
+        card_page = vis[pg * body: pg * body + body]
+        side, side_ids = _sidebar_lines(side_rows, issue_id, body, lw) if sidebar else (None, None)
+        cstate = "развернуть" if collapsed else "свернуть"
+        remain = max(0, int(REFRESH_SEC - (time.time() - last_side)))
+        page = f" · стр.{pg + 1}/{pages}" if pages > 1 else ""
+        if _draft_has(draft):
+            footer = (f"{R.WARN}✎ черновик: {' · '.join(_draft_bits(draft))}{R.RESET}  "
+                      f"{R.MUT}Enter отправить · a/s/t ещё · q разобрать{R.RESET}")
+        else:
+            pairs = [("↑↓←→", "листать")]
+            if imgs:
+                pairs.append((f"v·1-{len(imgs)}", "фото"))
+            pairs += [("a", "коммент"), ("p", "SQL"), ("o", "браузер"), ("s", "статус"),
+                      ("t", "время"), ("c", cstate), ("r", "обновить"), ("?", "помощь"), ("q", "назад")]
+            footer = f"{R.MUT}↻{remain}с{page}{R.RESET}  " + R.render_hint(pairs)
+        T = R.T                                          # единый «скелет», та же панель, что у списка
+
+        def _content_row(y):                             # один ряд тела: [сайдбар │] card_page[y]
+            row = R.crow(CW, T["fg"], T["panel"])
+            if sidebar:
+                for j, cell in enumerate(R.ansi_to_cells(side[y] if y < len(side) else "", lw, T["fg"], T["panel"])):
+                    row[j] = cell
+                row[lw] = R._Cell("│", T["line"], T["panel"], False)
+                for j, cell in enumerate(R.ansi_to_cells(card_page[y] if y < len(card_page) else "", content_w, T["fg"], T["panel"])):
+                    row[lw + 2 + j] = cell
+            else:
+                for j, cell in enumerate(R.ansi_to_cells(card_page[y] if y < len(card_page) else "", CW, T["fg"], T["panel"])):
+                    row[j] = cell
+            return row
+
+        inner = [_content_row(y) for y in range(body)]
+        sep = R.crow(CW, T["line"], T["panel"]); R.cstamp(sep, 0, "─" * CW, T["line"], T["panel"]); inner.append(sep)
+        inner.append(R.ansi_to_cells("  " + footer, CW, T["muted"], T["panel"]))
+        stt = (iss.get("status") or {}).get("name", "")
+        R.panel_screen(f"REDMINE · #{issue_id} · {stt}", inner, CW)
+        k = wait_key()
+        if k == "RESIZE":
+            continue
+        if k == "EOF":
+            return "q"
+        if isinstance(k, tuple):                         # мышь (координаты от угла окна; учесть центровку панели)
+            _, btn, mx, my, press = k
+            if btn & 64:                                 # колесо листает страницы
+                pg = min(pages - 1, pg + 1) if (btn & 1) else max(0, pg - 1)
+            elif (not press) and (btn & 3) == 0:         # отпускание левой кнопки
+                box_w, box_h = CW + 2, len(inner) + 2
+                ox, oy = max(0, (c - box_w) // 2), max(0, (r - box_h) // 2)
+                i = my - (oy + 2)                        # индекс строки тела
+                if 0 <= i < body:
+                    if sidebar and ox + 2 <= mx < ox + 2 + lw and side_ids and i < len(side_ids) and side_ids[i]:
+                        if str(side_ids[i]) != str(issue_id):   # клик по соседней заявке
+                            can_leave, did_send = _leave_ok(iss, draft)
+                            if can_leave:                       # черновик пуст/ушёл/отброшен, переходим
+                                issue_id = side_ids[i]; pg = 0; dirty = True
+                            elif did_send:
+                                dirty = True                    # часть осталась, остаёмся на текущей
+                    elif i < len(card_page):             # клик по подписи вложения, открыть картинку
+                        m = re.search(r"📎 \[(\d+)\]", card_page[i])
+                        if m and imgs:
+                            idx = int(m.group(1)) - 1
+                            if 0 <= idx < len(imgs):
+                                R.gallery(imgs, idx); R.mouse_on()
+            continue
+        if k is None:                                    # тик (1с): тема + сайдбар + отсчёт в футере
+            if R.theme_changed():
+                R.reload_theme(); cache["sig"] = None
+            if side_bg["rows"] is not None:              # фоновое обновление готово, подхватить
+                if side_bg["rows"]:
+                    side_rows = side_bg["rows"]
+                side_bg["rows"] = None; side_bg["loading"] = False
+            if not side_bg["loading"] and time.time() - last_side > REFRESH_SEC:
+                last_side = time.time(); side_bg["loading"] = True
+                threading.Thread(target=lambda: side_bg.__setitem__("rows", fetch_list() or []),
+                                 daemon=True).start()    # НЕ морозим карточку, пока тянем список
+            continue
+        if k in ("RIGHT", "DOWN", "j", "PGDN", " "):
+            pg = min(pages - 1, pg + 1); continue
+        if k in ("LEFT", "UP", "k", "PGUP"):
+            pg = max(0, pg - 1); continue
+        if k in ("g", "HOME"):
+            pg = 0; continue
+        if k in ("G", "END"):
+            pg = pages - 1; continue
+        if k in ("a", "A", "p", "P"):                    # коммент в черновик (p — с SQL из буфера)
+            r0 = R.pick_comment(iss, paste_sql=(k in ("p", "P"))); R.mouse_on()
+            if r0:
+                draft["note"], draft["private"] = r0
+            continue
+        if k in ("s", "S"):                              # статус в черновик
+            r0 = R.pick_status(iss); R.mouse_on()
+            if r0:
+                draft["status_id"], draft["status_name"] = r0
+            continue
+        if k in ("t", "T"):                              # трудозатраты в черновик
+            r0 = R.pick_time(iss); R.mouse_on()
+            if r0:
+                draft["mins"] = r0
+            continue
+        if k in ("c", "C"):
+            collapsed = not collapsed; continue
+        if k in ("v", "V") and imgs:
+            R.gallery(imgs, 0); R.mouse_on(); continue
+        if k and k.isdigit() and imgs:
+            idx = int(k) - 1
+            if 0 <= idx < len(imgs):
+                R.gallery(imgs, idx); R.mouse_on()
+            continue
+        if k in ("o", "O"):
+            subprocess.Popen([os.path.join(HERE, "chrome-here"), f"{R.BASE}/issues/{issue_id}"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            continue
+        if k in ("r", "R"):
+            dirty = True; continue
+        if k == "?":
+            help_screen("card"); continue
+        if k == "ENTER":                                 # с черновиком разобрать и отправить, иначе назад
+            if _draft_has(draft):
+                res = review_draft(iss, draft); R.mouse_on()
+                if res in ("sent", "partial"):
+                    dirty = True                         # перечитать заявку: показать новый коммент/статус
+                continue                                 # остаёмся в карточке
+            return "back"
+        if k in ("ESC", "q", "Q"):                       # q как Esc; не теряем черновик молча
+            can_leave, did_send = _leave_ok(iss, draft)
+            if can_leave:
+                return "back"                            # (EOF уже обработан выше, выход из приложения)
+            if did_send:
+                dirty = True                             # часть ушла: обновить и остаться
+            continue
+
+def main():
+    if R.KEY == "":
+        print(f"{R.ERR}Нет ключа Redmine (secret-tool service=redmine-notify){R.RESET}")
+        return 1
+    if R._FD is None:                                  # тест без tty
+        if os.environ.get("RMSHIFT_ALLOW_PIPE") != "1":
+            print("redmine-view: нужен интерактивный терминал (через foot)."); return 1
+        rows = fetch_list()
+        for it in rows[:10]:
+            print(f"#{it['id']}  {it['status']}  {it['subject']}")
+        if rows:
+            print("\n--- карточка первой ---"); print(R.render_issue(R.get_issue(rows[0]["id"])))
+        return 0
+
+    signal.signal(signal.SIGWINCH, _on_winch)          # зум или ресайз дают мгновенную перерисовку
+    sys.stdout.write("\033[?1049h\033[?25l")           # alt-screen + спрятать курсор
+    R.raw_on()                                         # cbreak на весь сеанс, иначе стрелки эхаются
+    R.mouse_on()                                       # трекинг мыши (foot SGR-1006)
+    try:
+        box = {}
+        th = threading.Thread(target=lambda: box.__setitem__("rows", fetch_list()), daemon=True)
+        th.start()
+        splash(lambda: not th.is_alive())              # ASCII-анимация пока тянем заявки
+        th.join()
+        rows = box.get("rows") or []
+        while not rows:                                # пусто и ошибка сети дают разные сообщения, можно повторить
+            R.clear()
+            if LAST_FETCH["err"]:
+                print(f"{R.ERR}  Не удалось получить заявки:{R.RESET} {LAST_FETCH['err']}")
+                print(f"{R.MUT}  Проверь сеть / VPN / ключ.    r — повторить · q — выход{R.RESET}")
+            else:
+                print(f"{R.MUT}  Активных заявок нет.    r — обновить · q — выход{R.RESET}")
+            k = R.read_key()
+            if k in ("r", "R"):
+                rows = fetch_list()
+            elif k in ("q", "Q", "ESC", "EOF") or k is None:
+                return 0
+        sel, numbuf, last_refresh = 0, "", time.time()
+        query, stat_filter = "", None                  # фильтр: подстрока + статус
+        bg = {"loading": False, "done": True, "rows": None, "cur": None}   # фоновое обновление
+        spin, spin_i = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", 0
+        def kick():                                    # запустить fetch_list в фоне, UI не морозится
+            if bg["loading"]:
+                return
+            bg.update(loading=True, done=False, rows=None, cur=(view[sel]["id"] if view else None))
+            def run():
+                rs = fetch_list(); bg["rows"] = rs; bg["done"] = True
+            threading.Thread(target=run, daemon=True).start()
+        while True:
+            if R.theme_changed():
+                R.reload_theme()
+            if bg["loading"] and bg["done"]:           # фоновое обновление готово, подхватить
+                bg["loading"] = False
+                if bg["rows"]:
+                    rows = bg["rows"]
+                    nv = [r for r in rows if _match(r, query, stat_filter)]
+                    sel = next((i for i, x in enumerate(nv) if x["id"] == bg["cur"]), 0)
+            view = [r for r in rows if _match(r, query, stat_filter)]
+            sel = max(0, min(sel, len(view) - 1)) if view else 0
+            if (not bg["loading"]) and time.time() - last_refresh >= REFRESH_SEC:   # автообновление в фоне
+                last_refresh = time.time(); kick()
+            busy = (spin[spin_i % len(spin)] + " обновляю…") if bg["loading"] else ""
+            zmap = draw(view, sel, numbuf, last_refresh, query, stat_filter, busy=busy)
+            k = wait_key(0.12 if bg["loading"] else TICK)
+            if k == "RESIZE":
+                continue
+            if k == "EOF":
+                break
+            if isinstance(k, tuple):                   # мышь
+                _, btn, mx, my, press = k
+                if btn & 64:                           # колесо двигает выбор
+                    sel = min(len(view) - 1, sel + 1) if (btn & 1) else max(0, sel - 1)
+                    numbuf = ""
+                elif (not press) and (btn & 3) == 0:   # отпускание левой
+                    if my in zmap["rows"] and view:    # клик по заявке, открыть
+                        sel = zmap["rows"][my]; numbuf = ""
+                        if show_card(view[sel]["id"], view) in ("q", "Q"):
+                            break
+                        R.mouse_on()
+                    elif my == zmap["foot_row"]:       # клик по хоткею футера
+                        kk = next((v for col, v in zmap["foot_keys"].items() if abs(mx - col) <= 1), None)
+                        if kk == "q":
+                            break
+                        elif kk == "r":
+                            last_refresh = time.time(); kick()
+                        elif kk == "o" and view:
+                            subprocess.Popen([os.path.join(HERE, "chrome-here"), f"{R.BASE}/issues/{view[sel]['id']}"],
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                continue
+            if k is None:                              # тик: крутим спиннер, пока идёт фоновая загрузка
+                if bg["loading"]:
+                    spin_i += 1
+                continue
+            if k in ("/", "."):                        # поиск (в рус. раскладке '/' даёт '.')
+                query = search_loop(rows, query, stat_filter, last_refresh); sel = 0; numbuf = ""
+                continue
+            if k == "f":                               # фильтр по статусу циклом
+                opts = [None] + [s for s in ("Новая", "Новая инфо", "В работе") if any(r["status"] == s for r in rows)]
+                stat_filter = opts[(opts.index(stat_filter) + 1) % len(opts)] if stat_filter in opts else (opts[1] if len(opts) > 1 else None)
+                sel = 0; continue
+            if k == "?":
+                help_screen("list"); continue
+            if k and k.isdigit():
+                numbuf += k
+            elif k == "\x7f":
+                numbuf = numbuf[:-1]
+            elif k in ("DOWN", "j"):
+                sel = min(len(view) - 1, sel + 1); numbuf = ""
+            elif k in ("UP", "k"):
+                sel = max(0, sel - 1); numbuf = ""
+            elif k == "PGDN":
+                sel = min(len(view) - 1, sel + 10)
+            elif k == "PGUP":
+                sel = max(0, sel - 10)
+            elif k in ("g", "HOME"):
+                sel = 0
+            elif k in ("G", "END"):
+                sel = len(view) - 1
+            elif k in ("a", "A") and view:             # быстрые действия по выбранной заявке
+                iss = R.get_issue(view[sel]["id"])
+                if iss:
+                    R.add_comment_ui(iss)
+                R.mouse_on()
+            elif k in ("s", "S") and view:
+                iss = R.get_issue(view[sel]["id"])
+                if iss:
+                    R.change_status_ui(iss)
+                R.mouse_on(); last_refresh = time.time(); kick()
+            elif k in ("t", "T") and view:
+                iss = R.get_issue(view[sel]["id"])
+                if iss:
+                    R.add_time_ui(iss)
+                R.mouse_on()
+            elif k in ("o", "O") and view:
+                tgt = numbuf or view[sel]["id"]; numbuf = ""
+                subprocess.Popen([os.path.join(HERE, "chrome-here"), f"{R.BASE}/issues/{tgt}"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif k in ("r", "R"):
+                last_refresh = time.time(); kick()
+            elif k in ("ENTER", "RIGHT", "l") and view:
+                tgt = numbuf or view[sel]["id"]; numbuf = ""
+                if show_card(tgt, view) in ("q", "Q"):
+                    break
+                R.mouse_on()                           # карточка могла снять трекинг (промпт/галерея)
+            elif k in ("q", "Q", "ESC"):
+                if numbuf:
+                    numbuf = ""
+                elif query or stat_filter:             # сначала сброс фильтра, потом выход
+                    query = ""; stat_filter = None; sel = 0
+                else:
+                    break
+    finally:
+        R.mouse_off()
+        R.restore_term()
+        sys.stdout.write("\033[?25h\033[?1049l"); sys.stdout.flush()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+# Единый конфиг redmine-* инструментов. → копировать в ~/.config/redmine-tui.conf
+# Читается из python (redmine_conf.py) И source-ится из bash (redmine-open, redmine-shift).
+# Формат: KEY=VALUE, без пробелов вокруг '='. Значения с & или || ОБЯЗАТЕЛЬНО в кавычках
+# (файл source-ится из bash — иначе & запустит фон-процесс, || выполнит хвост как команду).
+
+BASE=https://redmine.example.com
+
+# id активности для списания времени (Redmine → Администрирование → Перечисления).
+ACTIVITY_ID=9
+
+# Прозрачный фон панелей TUI (как у foot). 0/false/no/off — выключить. По умолчанию вкл.
+# TRANSPARENT=1
+
+# Источники для redmine-list (меню активных заявок), несколько — через "||". В КАВЫЧКАХ!
+# Пусто/не задано → все открытые заявки, видимые ключу.
+LIST_SOURCES="status_id=open&sort=updated_on:desc"

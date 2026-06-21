@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# Составить смену через Redmine REST API.
+#
+# Аргументы — user_id (один или несколько). Без аргументов = текущий пользователь.
+# Источник задач для КАЖДОГО user_id (объединяется по всем):
+#   1) time_entries (где списывал время за сегодня+вчера)
+#   2) issues assigned_to_id=ID + updated_on >= вчера  ← даёт «Нет трудозатрат»
+# Каждый тикет добирается поштучно (/issues/ID.json) ради spent_hours и cf_109,
+# затем раскладывается по категориям и форматируется как в расширении.
+# Ключ — из secret-tool (service=redmine-notify), не в коде.
+#
+# Флаги:
+#   --json      машинный вывод (массив заявок с категориями) — для TUI, без буфера
+#   --fix       открыть интерактивный разбор смены (redmine-shift-fix), затем выйти
+#   --dry-run   (вместе с --fix) не писать в Redmine, только показать запросы
+set -uo pipefail
+
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/redmine-tui.conf"   # единый конфиг (BASE)
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+BASE="${BASE:-https://redmine.example.com}"
+note() { command -v notify-send >/dev/null 2>&1 && notify-send "$@"; }
+
+# ── разбор флагов ───────────────────────────────────────────────────────────
+MODE="text"; FIX=0; DRYRUN=0; ids=()
+for a in "$@"; do
+    case "$a" in
+        --json)    MODE="json" ;;
+        --fix)     FIX=1 ;;
+        --dry-run) DRYRUN=1 ;;
+        *)         ids+=("$a") ;;
+    esac
+done
+
+# --fix → передаём управление интерактивному TUI
+if [ "$FIX" -eq 1 ]; then
+    fixargs=()
+    [ "$DRYRUN" -eq 1 ] && fixargs+=(--dry-run)
+    exec python3 "$HOME/.local/bin/redmine-shift-fix" "${fixargs[@]}" "${ids[@]}"
+fi
+
+KEY="$(secret-tool lookup service redmine-notify 2>/dev/null || true)"
+if [ -z "$KEY" ]; then
+    echo "❌ Нет ключа Redmine в secret-tool (service=redmine-notify)." >&2
+    [ "$MODE" = "json" ] && echo "[]"
+    note -u critical "Смена" "Нет ключа Redmine (secret-tool service=redmine-notify)"
+    exit 1
+fi
+
+HDR="X-Redmine-API-Key: $KEY"
+TODAY="$(date +%F)"
+YEST="$(date -d yesterday +%F)"
+
+# Проверяем связь и ключ ДО того, как решим «задач нет». Без этой проверки
+# упавшая сеть или протухший ключ молча выглядят как пустая смена, и человек
+# этого не замечает. curl -f валит на HTTP-ошибке, -S показывает причину.
+me_json="$(curl -fsS -H "$HDR" "$BASE/users/current.json")" || {
+    echo "Redmine недоступен (сеть или ключ). Смена не собрана." >&2
+    [ "$MODE" = "json" ] && echo "[]"
+    note -u critical "Смена" "Redmine недоступен, смена не собрана"
+    exit 1
+}
+
+# список пользователей: либо переданные аргументы, либо текущий
+users=("${ids[@]}")
+if [ "${#users[@]}" -eq 0 ]; then
+    me="$(printf '%s' "$me_json" | jq -r '.user.id // empty')"
+    [ -n "$me" ] && users=("$me")
+fi
+if [ "${#users[@]}" -eq 0 ]; then
+    echo "Не удалось определить пользователя." >&2
+    [ "$MODE" = "json" ] && echo "[]"
+    exit 1
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+[ "$MODE" = "text" ] && echo "⏳ Собираю смену за $YEST … $TODAY …" >&2
+
+# ── собрать ID задач из двух источников, ПАРАЛЛЕЛЬНО по всем пользователям ────
+i=0
+for u in "${users[@]}"; do
+    i=$((i + 1))
+    ( curl -s -H "$HDR" "$BASE/time_entries.json?user_id=$u&from=$YEST&to=$TODAY&limit=100" \
+        | jq -r '.time_entries[]? | .issue?.id? // empty' 2>/dev/null ) > "$TMP/L_${i}a" &
+    ( curl -s -H "$HDR" "$BASE/issues.json?assigned_to_id=$u&status_id=*&updated_on=%3E%3D$YEST&limit=100" \
+        | jq -r '.issues[]?.id // empty' 2>/dev/null ) > "$TMP/L_${i}b" &
+done
+wait
+cat "$TMP"/L_* 2>/dev/null | sort -un > "$TMP/uids"
+
+if [ ! -s "$TMP/uids" ]; then
+    if [ "$MODE" = "json" ]; then echo "[]"; else
+        echo "🟢 Нет задач за смену ($YEST … $TODAY)." >&2
+        note "Смена" "Нет задач за $YEST … $TODAY"
+    fi
+    exit 0
+fi
+
+# ── поштучно добрать JSON каждой задачи (параллельно, без задержек) ──────────
+export RM_KEY="$KEY" RM_BASE="$BASE" RM_TMP="$TMP"
+xargs -P16 -I '{}' sh -c \
+    'curl -s -H "X-Redmine-API-Key: $RM_KEY" "$RM_BASE/issues/$1.json" >"$RM_TMP/i_$1.json"' \
+    _ '{}' < "$TMP/uids"
+
+# ── бан-фильтр клиентов/служебных задач: токены в ~/.config/redmine-shift-ban.txt
+#    (по одному в строке, '#' — комментарий), НЕ в коде. Нет файла → фильтр пуст.
+BANFILE="${XDG_CONFIG_HOME:-$HOME/.config}/redmine-shift-ban.txt"
+ban=()
+[ -f "$BANFILE" ] && mapfile -t ban < <(grep -vE '^[[:space:]]*(#|$)' "$BANFILE")
+ban_json="$(jq -nc '$ARGS.positional' --args -- "${ban[@]}")"
+
+# ── единый источник правды: массив заявок с категориями (+ бан-фильтр) ───────
+jq -n --arg base "$BASE" --argjson ban "$ban_json" '
+  [ inputs.issue ]
+  | map({
+      id:          .id,
+      subject:     (.subject // ""),
+      project:     (.project.name // "—"),
+      status:      (.status.name // ""),
+      description: (.description // ""),
+      reason:      (([.custom_fields[]? | select(.id==109) | .value] | first) // ""),
+      hasTime:     ((.spent_hours // 0) > 0),
+      line:        ($base + "/issues/" + (.id|tostring) + " – " + (.project.name // "—") + ": " + (.subject // ""))
+    })
+  | map(. + {cat:
+      ( if   (.reason == "")                        then "Нет причины обращения"
+        elif (.hasTime | not)                       then "Нет трудозатрат"
+        elif (.status|test("В процессе|В работе"))  then "В работе"
+        elif (.status|test("Ожидание"))             then "Ожидание ответа от клиента"
+        elif (.status|test("Решена|Закрыта"))       then "Решена"
+        elif (.status|test("Новая"))                then "Новая"
+        else null end ) })
+  | map(select(.cat != null))
+  | map(select(.line as $l | ([$ban[] as $b | select($l|contains($b))] | length) == 0))
+' "$TMP"/i_*.json > "$TMP/arr.json"
+
+# ── вывод ───────────────────────────────────────────────────────────────────
+if [ "$MODE" = "json" ]; then
+    cat "$TMP/arr.json"
+    exit 0
+fi
+
+jq -r '
+  . as $arr
+  | (group_by(.cat) | map({key:.[0].cat, value:(map(.line)|sort)}) | from_entries) as $g
+  | "Доброе утро! По смене:\n\n"
+    + ( ["В работе","Ожидание ответа от клиента","Решена","Новая","Нет трудозатрат","Нет причины обращения"]
+        | map(. + ":\n\n" + (($g[.] // []) | join("\n"))) | join("\n\n") )
+' "$TMP/arr.json" > "$TMP/shift.txt"
+
+cat "$TMP/shift.txt"
+
+count="$(grep -c '/issues/' "$TMP/shift.txt" 2>/dev/null || echo 0)"
+if command -v wl-copy >/dev/null 2>&1; then
+    wl-copy < "$TMP/shift.txt"
+    echo >&2
+    echo "📋 Смена скопирована в буфер ($count задач за $YEST … $TODAY)." >&2
+fi
+note "Смена собрана" "$count задач за $YEST … $TODAY — в буфере"

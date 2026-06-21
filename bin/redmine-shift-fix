@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Интерактивный разбор смены: проставить причину обращения (cf 109) и трудозатраты.
+
+Поток:
+  1) цветная сводка смены по категориям;
+  2) по очереди проблемные заявки (нет причины / нет трудозатрат):
+       - красивая ASCII-карточка заявки со всей историей (общий движок redmine_tui,
+         тема caelestia, подсветка SQL), листается ↑/↓;
+       - выбор причины (если её нет) и/или времени (если его нет);
+       - подтверждение, затем запись через REST (PUT issue / POST time_entries);
+  3) обновление текста смены в буфере.
+
+Данные смены берём из `redmine-shift --json <ids>`. Ключ из secret-tool. Активность = 35 «Не задано».
+Флаги: --dry-run (ничего не пишет, показывает запросы).  Тест без tty: RMSHIFT_ALLOW_PIPE=1.
+"""
+import sys, os, json, subprocess, datetime, time, itertools, threading, concurrent.futures
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import redmine_tui as R
+
+ACTIVITY_ID = R.ACTIVITY_ID                            # единый конфиг (redmine-tui.conf)
+CF_REASON = 109
+REASONS = [
+    "Превентивные мероприятия", "Запрос на правку данных", "Консультация",
+    "Нарушение целостности БД", "Проблема с ПО WMS", "Проблема с инфраструктурой",
+    "Проблема с ПО Voice", "Прочее",
+]
+TIME_PRESETS = {"1": 5, "2": 10, "3": 15, "4": 20}
+DRYRUN = "--dry-run" in sys.argv
+IDS = [a for a in sys.argv[1:] if a.isdigit()]
+
+A, FG, MUT, ERR, OK, SEC, TER, LINE = R.A, R.FG, R.MUT, R.ERR, R.OK, R.SEC, R.TER, R.LINE
+RESET, BOLD, DIM = R.RESET, R.BOLD, R.DIM
+CAT_ORDER = ["В работе", "Ожидание ответа от клиента", "Решена", "Новая",
+             "Нет трудозатрат", "Нет причины обращения"]
+
+# ── запись через REST ────────────────────────────────────────────────────────
+def mins_to_hm(m):
+    return f"{m // 60}:{m % 60:02d}"
+
+def show_request(method, path, payload):
+    print(f"  {MUT}[DRY] {method} {R.BASE}{path}{RESET}")
+    print(f"  {MUT}      {json.dumps(payload, ensure_ascii=False)}{RESET}")
+
+def set_reason(issue_id, reason):
+    payload = {"issue": {"custom_fields": [{"id": CF_REASON, "value": reason}]}}
+    if DRYRUN:
+        show_request("PUT", f"/issues/{issue_id}.json", payload); return True, "DRY"
+    code, body = R.api("PUT", f"/issues/{issue_id}.json", payload)
+    return code == 204, f"HTTP {code}" + (("  " + body.strip()) if (code != 204 and body.strip()) else "")
+
+def add_time(issue_id, mins):
+    payload = {"time_entry": {"issue_id": int(issue_id), "hours": mins_to_hm(mins),
+                             "activity_id": ACTIVITY_ID, "comments": ""}}
+    if DRYRUN:
+        show_request("POST", "/time_entries.json", payload); return True, "DRY"
+    code, body = R.api("POST", "/time_entries.json", payload)
+    return code == 201, f"HTTP {code}" + (("  " + body.strip()) if (code != 201 and body.strip()) else "")
+
+def verify(issue_id):
+    iss = R.get_issue(issue_id)
+    if not iss:
+        return None
+    cf = next((c.get("value") for c in iss.get("custom_fields", []) if c.get("id") == CF_REASON), "")
+    return (cf or "—"), iss.get("spent_hours", 0)
+
+# ── ввод ─────────────────────────────────────────────────────────────────────
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+def prompt_reason():
+    print(f"\n  {BOLD}Причина обращения:{RESET}")
+    for i, r in enumerate(REASONS, 1):
+        print(f"    {A}{i}{RESET}) {r}")
+    print(f"    {DIM}Enter/0) пропустить{RESET}")
+    while True:
+        a = ask("  причина → ")
+        if a is None or a in ("", "0"):
+            return None
+        if a.isdigit() and 1 <= int(a) <= len(REASONS):
+            return REASONS[int(a) - 1]
+        print(f"  {ERR}неверный ввод{RESET}")
+
+def prompt_time():
+    print(f"\n  {BOLD}Трудозатраты:{RESET}")
+    print(f"    {A}1{RESET}) 5м   {A}2{RESET}) 10м   {A}3{RESET}) 15м   {A}4{RESET}) 20м   {A}c{RESET}) своё (мин)")
+    print(f"    {DIM}Enter/s) пропустить{RESET}")
+    while True:
+        a = ask("  время → ")
+        if a is None or a == "" or a.lower() == "s":
+            return None
+        if a in TIME_PRESETS:
+            return TIME_PRESETS[a]
+        if a.lower() == "c":
+            m = ask("  минут → ")
+            if m and m.isdigit() and int(m) > 0:
+                return int(m)
+            print(f"  {ERR}нужно целое > 0{RESET}"); continue
+        print(f"  {ERR}неверный ввод{RESET}")
+
+# ── рендер ───────────────────────────────────────────────────────────────────
+def render_summary(data, dates):
+    w = min(R.cols() - 1, 70)
+    counts = {c: 0 for c in CAT_ORDER}
+    for t in data:
+        counts[t["cat"]] = counts.get(t["cat"], 0) + 1
+    mx = max([1] + list(counts.values()))
+    print()
+    print(f"  {A}{BOLD}СМЕНА · {dates}{RESET}  {MUT}· всего {len(data)}{RESET}")
+    print(LINE + "─" * w + RESET)
+    for c in CAT_ORDER:
+        n = counts.get(c, 0)
+        col = R.status_color(c) if c in ("В работе", "Ожидание ответа от клиента", "Решена", "Новая") else (ERR if n else MUT)
+        bar = "█" * int(round(14 * n / mx)) if n else ""
+        print(f"  {col}{c:<26}{RESET} {col}{bar:<14}{RESET} {BOLD}{n}{RESET}")
+    print(LINE + "─" * w + RESET)
+
+def flags_line(t):
+    f = [f"{OK}причина ✓{RESET}" if t["reason"] else f"{ERR}причина — НЕТ{RESET}",
+         f"{OK}время ✓{RESET}" if t["hasTime"] else f"{ERR}время — НЕТ{RESET}"]
+    return "  " + "    ".join(f)
+
+_cache = {}
+def prefetch(ids):
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    for i in ids:
+        _cache[i] = ex.submit(R.get_issue, i)
+    ex.shutdown(wait=False)
+
+def issue_of(i):
+    fut = _cache.get(i)
+    try:
+        return fut.result() if fut is not None else R.get_issue(i)
+    except Exception:
+        return None
+
+def show_ticket(t, idx, total):
+    """Карточка заявки (листалка стрелками вверх-вниз). Возвращает 'ok' или 'quit'."""
+    iss = issue_of(t["id"])
+    if iss:
+        collapsed = True
+        R.raw_on()
+        while True:
+            k = R.pager(R.render_issue(iss, collapse=collapsed).split("\n"),
+                        hint="←/→↑/↓ страницы · c — развернуть SQL · Enter — к вводу · q — выход",
+                        title=f"РАЗБОР СМЕНЫ · #{t['id']} · [{idx}/{total}]")
+            if k in ("c", "C"):
+                collapsed = not collapsed; continue
+            if k in ("v", "V") or (k and k.isdigit()):
+                continue
+            break
+        R.raw_off()                                    # обратно в cooked для ввода причины/времени
+        if k in ("q", "Q"):
+            return "quit"
+        R.clear()
+    else:
+        print(f"\n{LINE}{'─' * min(R.cols() - 1, 80)}{RESET}")
+        print(f"  {BOLD}[{idx}/{total}] #{t['id']}  ·  {R.clean(t['subject'])}{RESET}")
+        print(f"  {MUT}проект: {R.clean(t['project'])}  ·  статус: {R.clean(t['status'])}{RESET}")
+    print(f"  {A}{BOLD}#{t['id']}{RESET}  {R.clean(t['subject'])}")
+    print(flags_line(t))
+    return "ok"
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def main():
+    if R.KEY == "":
+        print(f"{ERR}Нет ключа Redmine (secret-tool service=redmine-notify){RESET}")
+        return 1
+    if R._FD is None and os.environ.get("RMSHIFT_ALLOW_PIPE") != "1":
+        print("redmine-shift-fix: нужен интерактивный терминал (запуск через foot).")
+        return 1
+
+    today = datetime.date.today()
+    yest = today - datetime.timedelta(days=1)
+    dates = f"{yest.strftime('%d.%m')}–{today.strftime('%d.%m')}"
+    if DRYRUN:
+        print(f"{R.WARN}{BOLD}  ⚠ DRY-RUN: ничего не пишется в Redmine, только показываю запросы.{RESET}")
+
+    cmd = [os.path.expanduser("~/.local/bin/redmine-shift"), "--json"] + IDS
+    result = {}
+    th = threading.Thread(target=lambda: result.__setitem__("r", subprocess.run(cmd, capture_output=True, text=True)), daemon=True)
+    th.start()
+    spin = itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+    t0 = time.time()
+    while th.is_alive():
+        sys.stdout.write(f"\r{MUT}  {next(spin)} собираю смену (опрашиваю Redmine)…  {int(time.time() - t0)}с{RESET}")
+        sys.stdout.flush(); time.sleep(0.1)
+    th.join()
+    sys.stdout.write("\r" + " " * 56 + "\r"); sys.stdout.flush()
+    r = result.get("r")
+    try:
+        data = json.loads(r.stdout) if (r and r.stdout.strip()) else []
+    except json.JSONDecodeError:
+        print(f"{ERR}Не удалось получить данные смены.{RESET}\n{r.stderr if r else ''}")
+        return 1
+
+    render_summary(data, dates)
+
+    problems = [t for t in data if t["reason"] == "" or not t["hasTime"]]
+    if not problems:
+        print(f"\n{OK}{BOLD}  ✓ Все заявки в порядке — причина и трудозатраты везде проставлены.{RESET}")
+    else:
+        prefetch([t["id"] for t in problems])
+        print(f"\n{TER}{BOLD}  Требуют разбора: {len(problems)}{RESET}  {DIM}(Enter — пропустить поле, q — выход){RESET}")
+        done = 0
+        for idx, t in enumerate(problems, 1):
+            if show_ticket(t, idx, len(problems)) == "quit":
+                print(f"  {DIM}выход{RESET}"); break
+            planned = []
+            if t["reason"] == "":
+                rr = prompt_reason()
+                if rr:
+                    planned.append(("reason", rr))
+            if not t["hasTime"]:
+                m = prompt_time()
+                if m:
+                    planned.append(("time", m))
+            if not planned:
+                print(f"  {DIM}→ пропущено{RESET}"); continue
+
+            summ = ", ".join((f"причина=«{v}»") if k == "reason" else (f"время={v}м") for k, v in planned)
+            print(f"\n  {BOLD}Записать:{RESET} {summ}")
+            a = ask("  [Enter=записать / s=пропустить / q=выход] → ")
+            if a is None or a.lower() == "q":
+                print(f"  {DIM}выход{RESET}"); break
+            if a.lower() == "s":
+                print(f"  {DIM}→ пропущено{RESET}"); continue
+
+            for k, v in planned:
+                if k == "reason":
+                    ok, msg = set_reason(t["id"], v); label = f"причина «{v}»"
+                else:
+                    ok, msg = add_time(t["id"], v); label = f"время {v}м ({mins_to_hm(v)})"
+                mark = f"{OK}✓{RESET}" if ok else f"{ERR}✗{RESET}"
+                print(f"  {mark} {label}  {DIM}{msg}{RESET}")
+            done += 1
+            if not DRYRUN:
+                vv = verify(t["id"])
+                if vv:
+                    print(f"  {DIM}проверка: причина={vv[0]!r}, время={vv[1]}ч{RESET}")
+        print(f"\n{OK}{BOLD}  Обработано заявок: {done}/{len(problems)}{RESET}")
+
+    if DRYRUN:
+        print(f"{DIM}[DRY] пропускаю обновление буфера.{RESET}")
+    else:
+        print(f"{DIM}Обновляю смену в буфере…{RESET}")
+        subprocess.run([os.path.expanduser("~/.local/bin/redmine-shift")] + IDS, stdout=subprocess.DEVNULL)
+        print(f"{OK}  ✓ Смена скопирована в буфер.{RESET}")
+
+    try:
+        input(f"\n{DIM}Enter — закрыть…{RESET}")
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    finally:
+        R.restore_term()

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Локальные конфиги с реальным хостом / id проектов / именами клиентов — НИКОГДА не коммитить.
+# Живые копии лежат в ~/.config/, не здесь; эти правила страхуют от случайного копирования в репо.
+config/redmine-tui.conf
+config/redmine-notify.config
+config/redmine-shift-ban.txt
+redmine-tui.conf
+redmine-notify.config
+redmine-shift-ban.txt
+*.local
+
+# в репо хранятся только *.example
+!config/*.example

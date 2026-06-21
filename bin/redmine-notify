@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Watch Redmine for issues entering a watched status ("Новая" / "Новая информация")
+or getting new information, and raise a desktop notification with an "Открыть заявку"
+button that opens the issue in Chrome on the current workspace.
+
+Runs as a long-lived daemon (`--daemon`) so the notification action can be handled:
+a freedesktop action click is delivered back to the *sending* process, so the sender
+must stay alive. A GLib main loop polls every POLL_SECONDS and also dispatches the
+button callbacks. Without `--daemon` it does a single poll (handy for testing; the
+button won't be clickable since the process exits).
+
+Config / credentials:
+  - base URL, sources, watched statuses -> ~/.config/redmine-notify/config
+  - REST API key                        -> secret-tool, service "redmine-notify"
+
+Detection: for every issue a source returns whose status is in WATCH_STATUSES we form
+the key "<id>:<updated_on>"; a key we've never seen -> notify. updated_on changes on
+any edit, so this fires for a brand-new ticket AND for new info on an existing one.
+First run primes the cache silently.
+"""
+
+import fcntl
+import html
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import gi
+gi.require_version("Notify", "0.7")
+from gi.repository import GLib, Notify  # noqa: E402
+
+CONFIG = Path.home() / ".config" / "redmine-notify" / "config"
+CACHE_DIR = Path.home() / ".cache" / "redmine-notify"
+CACHE_FILE = CACHE_DIR / "seen"
+LOCK_FILE = CACHE_DIR / "lock"
+CHROME_HERE = str(Path.home() / ".local" / "bin" / "chrome-here")
+
+DEFAULTS = {
+    "REDMINE_URL": "https://redmine.example.com",
+    "WATCH_STATUSES": "Новая,Новая информация",
+    "SOURCES": "status_id=open&sort=updated_on:desc",
+    "LIMIT": "100",
+    "MAX_NOTIFY": "10",
+    "SEEN_KEEP": "2000",
+    "URGENCY": "critical",
+    "POLL_SECONDS": "60",
+}
+
+_URGENCY = {"low": Notify.Urgency.LOW, "normal": Notify.Urgency.NORMAL, "critical": Notify.Urgency.CRITICAL}
+_live = []  # keep Notification objects alive so their action callbacks survive GC
+
+
+def log(msg):
+    print(f"[redmine-notify] {msg}", file=sys.stderr)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if CONFIG.exists():
+        for line in CONFIG.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            cfg[key.strip()] = val.strip()
+    return cfg
+
+
+def get_api_key():
+    try:
+        out = subprocess.run(
+            ["secret-tool", "lookup", "service", "redmine-notify"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError) as e:
+        log(f"secret-tool failed: {e}")
+        return None
+    return out.stdout.rstrip("\n") or None
+
+
+def _api_page(base, source, key, limit, offset):
+    url = f"{base.rstrip('/')}/issues.json?{source}&limit={limit}&offset={offset}"
+    req = urllib.request.Request(url, headers={
+        "X-Redmine-API-Key": key,
+        "Accept": "application/json",
+        "User-Agent": "redmine-notify/1.0",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        log(f"HTTP {e.code} for source [{source}]")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        log(f"request failed for source [{source}]: {e}")
+    return None
+
+
+def api_get(base, source, key, limit, max_pages=10):
+    """Paginate a source fully (saved queries ignore an added status filter and may
+    return >limit issues across several statuses)."""
+    per = int(limit)
+    issues = []
+    offset = 0
+    for _ in range(max_pages):
+        page = _api_page(base, source, key, per, offset)
+        if not page or "issues" not in page:
+            break
+        batch = page["issues"]
+        issues.extend(batch)
+        offset += len(batch)
+        if not batch or offset >= page.get("total_count", offset):
+            break
+    return issues
+
+
+def _on_open(notification, action, url):
+    log(f"opening {url}")
+    try:
+        subprocess.Popen([CHROME_HERE, url], start_new_session=True)
+    except Exception as e:
+        log(f"open action failed: {e}")
+    try:
+        notification.close()
+    except Exception:
+        pass
+
+
+def notify(base, issue, urgency):
+    iid = issue.get("id")
+    subject = (issue.get("subject") or "").strip()
+    status = (issue.get("status") or {}).get("name", "")
+    project = (issue.get("project") or {}).get("name", "")
+    author = (issue.get("author") or {}).get("name", "")
+    url = f"{base.rstrip('/')}/issues/{iid}"
+
+    summary = f"#{iid} · {status}" if status else f"Заявка #{iid}"
+    body_lines = []
+    if subject:
+        body_lines.append(f"<b>{html.escape(subject)}</b>")
+    meta = " · ".join(filter(None, [project, author]))
+    if meta:
+        body_lines.append(html.escape(meta))
+    body_lines.append(url)
+    body = "\n".join(body_lines)
+
+    n = Notify.Notification.new(summary, body, "dialog-information")
+    n.set_urgency(_URGENCY.get(urgency, Notify.Urgency.CRITICAL))
+    n.set_hint("desktop-entry", GLib.Variant.new_string("redmine"))
+    n.add_action("open", "Открыть заявку", _on_open, url)
+
+    def _closed(nn):
+        if nn in _live:
+            _live.remove(nn)
+    n.connect("closed", _closed)
+
+    try:
+        n.show()
+        _live.append(n)
+    except Exception as e:
+        log(f"notify show failed: {e}")
+
+
+def read_cache():
+    try:
+        text = CACHE_FILE.read_text()
+    except FileNotFoundError:
+        return None  # первого запуска ещё не было, кэша нет
+    keys = {ln.strip() for ln in text.splitlines() if ln.strip()}
+    # Пустой, но существующий файл остаётся только после оборванной записи.
+    # Трактуем это как «ещё не праймнут»: иначе каждая отслеживаемая заявка
+    # сойдёт за новую и прилетит шквал уведомлений.
+    return keys or None
+
+
+def write_cache(seen, keep):
+    recent = list(seen)[-keep:]
+    tmp = CACHE_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(recent) + "\n")
+    os.replace(tmp, CACHE_FILE)  # атомарная подмена: убитый посреди записи процесс не оставит битый кэш
+
+
+def poll_once():
+    cfg = load_config()  # reread each poll so config edits apply without restart
+    key = get_api_key()
+    if not key:
+        log("no API key in secret-tool (service=redmine-notify) — skipping")
+        return
+
+    base = cfg["REDMINE_URL"]
+    watch = {s.strip() for s in cfg["WATCH_STATUSES"].split(",") if s.strip()}
+    sources = [s.strip() for s in cfg["SOURCES"].split("||") if s.strip()]
+    limit = cfg["LIMIT"]
+
+    current = {}
+    for src in sources:
+        for issue in api_get(base, src, key, limit):
+            status = (issue.get("status") or {}).get("name", "")
+            if not watch or status in watch:
+                current[issue["id"]] = issue
+
+    keys_now = {f"{i}:{iss.get('updated_on', '')}" for i, iss in current.items()}
+    seen = read_cache()
+    keep = int(cfg["SEEN_KEEP"])
+
+    if seen is None:
+        write_cache(keys_now, keep)
+        log(f"primed {len(keys_now)} watched issue(s), no notifications")
+        return
+
+    new_issues = [iss for i, iss in current.items()
+                  if f"{i}:{iss.get('updated_on', '')}" not in seen]
+    new_issues.sort(key=lambda x: x.get("updated_on", ""), reverse=True)
+
+    if new_issues:
+        cap = int(cfg["MAX_NOTIFY"])
+        urgency = cfg["URGENCY"]
+        if len(new_issues) > cap:
+            log(f"{len(new_issues)} new, capping notifications to {cap}")
+        for issue in new_issues[:cap]:
+            notify(base, issue, urgency)
+
+    write_cache(seen | keys_now, keep)
+
+
+def _tick():
+    try:
+        poll_once()
+    except Exception as e:
+        log(f"poll error: {e}")
+    return True  # keep the GLib timer running
+
+
+def main():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("another instance is running, exiting")
+        return 0
+
+    Notify.init("Redmine")
+
+    if "--daemon" in sys.argv:
+        # POLL_SECONDS читается тут, вне защиты _tick. Кривое значение в конфиге
+        # уронило бы демон ещё до старта цикла, а systemd рестартил бы его по кругу.
+        try:
+            interval = max(5, int(load_config()["POLL_SECONDS"]))
+        except (ValueError, KeyError):
+            interval = int(DEFAULTS["POLL_SECONDS"])
+            log(f"bad POLL_SECONDS in config, falling back to {interval}s")
+        _tick()  # poll immediately on start
+        GLib.timeout_add_seconds(interval, _tick)
+        log(f"daemon started, polling every {interval}s")
+        try:
+            GLib.MainLoop().run()
+        except KeyboardInterrupt:
+            pass
+    else:
+        poll_once()  # single shot (button won't be clickable without the loop)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

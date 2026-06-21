@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Спрашивает номер заявки и открывает её в Chrome на текущем воркспейсе (chrome-here).
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+CONF="${XDG_CONFIG_HOME:-$HOME/.config}/redmine-tui.conf"   # единый конфиг (BASE)
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+BASE="${BASE:-https://redmine.example.com}"
+
+n=$(: | fuzzel --dmenu --namespace fuzzel-menu --prompt='Redmine ❯ ' --placeholder='номер заявки')
+n=$(printf '%s' "$n" | tr -cd '0-9')
+[ -z "$n" ] && exit 0
+exec "$HOME/.local/bin/chrome-here" "$BASE/issues/$n"
